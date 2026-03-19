@@ -49,179 +49,168 @@ const fetch   = require('node-fetch');
 const Doctor  = require('../models/Doctor');
 
 // ─────────────────────────────────────
-// Helper — City name → coordinates
-// Uses Nominatim (free, no key)
+// CACHE for city coordinates (10 min TTL)
 // ─────────────────────────────────────
-async function getCoordinates(city) {
-  const url  = `https://nominatim.openstreetmap.org/search`
-             + `?q=${encodeURIComponent(city)}`
-             + `&format=json&limit=1`;
-  const res  = await fetch(url, {
-    headers: { 'User-Agent': 'DocFinderApp/1.0' }
-  });
-  const data = await res.json();
-  if (data && data[0]) {
-    return {
-      lat: parseFloat(data[0].lat),
-      lng: parseFloat(data[0].lon)
-    };
+const coordCache = new Map();
+
+async function getCachedCoords(city) {
+  const cacheKey = city.toLowerCase();
+  
+  // Return if cached and fresh (< 10 min)
+  if (coordCache.has(cacheKey)) {
+    const cached = coordCache.get(cacheKey);
+    if (Date.now() - cached.time < 10 * 60 * 1000) {
+      console.log(`📍 Using cached coords for ${city}`);
+      return cached.coords;
+    }
+  }
+  
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&limit=1`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000); // 5s timeout
+    
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'DocFinderApp/1.0' },
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    
+    const data = await res.json();
+    if (data && data[0]) {
+      const coords = {
+        lat: parseFloat(data[0].lat),
+        lng: parseFloat(data[0].lon)
+      };
+      coordCache.set(cacheKey, { coords, time: Date.now() });
+      return coords;
+    }
+  } catch (err) {
+    console.log(`⚠️ Geocoding failed for ${city}: ${err.message}`);
   }
   return null;
 }
 
 // ─────────────────────────────────────
 // GET /api/doctors
-// ?city=Jammu&specialty=Cardiologist
+// ?city=Jammu&specialty=Cardiology
 // ─────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { city, specialty, name } = req.query;
+    // Validate input
+    const { city, specialty, name, limit = 20 } = req.query;
+    
+    if (name && name.length > 100) {
+      return res.status(400).json({ error: 'Name too long (max 100 chars)' });
+    }
+    if (city && city.length > 100) {
+      return res.status(400).json({ error: 'City too long (max 100 chars)' });
+    }
+    const numLimit = parseInt(limit);
+    if (isNaN(numLimit) || numLimit < 1 || numLimit > 100) {
+      return res.status(400).json({ error: 'Limit must be between 1-100' });
+    }
     const searchCity = city || 'Delhi';
 
-    // 1 — Get coordinates
-    const coords = await getCoordinates(searchCity);
+    // 1️⃣ Try to get coordinates with SHORT timeout
+    const coords = await getCachedCoords(searchCity);
+    
     if (!coords) {
-      // fallback to MongoDB
-      const docs = await Doctor.find({}).sort({ rating: -1 });
-      return res.json(docs);
-    }
-
-    // 2 — Build keyword
-    const keyword = specialty || name || 'doctor';
-
-    // 3 — Query Overpass API (with retry logic and GET method)
-    const makeOverpassQuery = (lat, lng) => `
-[out:json][timeout:60];
-(
-  node["amenity"="doctors"](around:15000,${lat},${lng});
-  node["amenity"="clinic"](around:15000,${lat},${lng});
-  way["amenity"="doctors"](around:15000,${lat},${lng});
-  way["amenity"="clinic"](around:15000,${lat},${lng});
-  relation["amenity"="doctors"](around:15000,${lat},${lng});
-  relation["amenity"="clinic"](around:15000,${lat},${lng});
-);
-out center;
-    `;
-
-    let elements = [];
-    try {
-      // Use GET method (more reliable than POST)
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 20000);
-
-      const query = encodeURIComponent(makeOverpassQuery(coords.lat, coords.lng));
-      const overpassUrl = `https://overpass-api.de/api/interpreter?data=${query}`;
-
-      const overpassRes = await fetch(overpassUrl, {
-        headers: { 'User-Agent': 'DocFinderApp/1.0' },
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeout);
-      
-      if (overpassRes.ok) {
-        const overpassData = await overpassRes.json();
-        elements = overpassData.elements || [];
-        if (elements.length > 0) {
-          console.log(`✅ Overpass API: Found ${elements.length} medical facilities in ${searchCity}`);
-        } else {
-          console.log(`⚠️  Overpass API: 0 results for ${searchCity} — checking MongoDB`);
-        }
-      } else {
-        console.log(`⚠️  Overpass returned ${overpassRes.status} — using MongoDB`);
-      }
-    } catch (osmErr) {
-      console.log(`⚠️  Overpass API unavailable: ${osmErr.message}`);
-    }
-
-    // 4 — If no results, fallback to MongoDB
-    if (elements.length === 0) {
-      console.log('No OSM results — using MongoDB fallback');
-      
-      // Build MongoDB query with filters
+      console.log(`⚠️ No coords for ${searchCity} - using MongoDB fallback`);
+      // Fallback to MongoDB
       const mongoQuery = {};
-      
       if (name) {
         mongoQuery.$or = [
           { name: { $regex: name, $options: 'i' } },
           { specialty: { $regex: name, $options: 'i' } }
         ];
       }
-      if (specialty) {
-        mongoQuery.specialty = { $regex: specialty, $options: 'i' };
-      }
-      if (city) {
-        mongoQuery.city = { $regex: city, $options: 'i' };
-      }
-      if (req.query.rating) {
-        mongoQuery.rating = { $gte: parseFloat(req.query.rating) };
-      }
+      if (specialty) mongoQuery.specialty = { $regex: specialty, $options: 'i' };
+      if (city) mongoQuery.city = { $regex: city, $options: 'i' };
       
-      const docs = await Doctor.find(mongoQuery).sort({ rating: -1 });
-      console.log(`✓ Found ${docs.length} doctors in MongoDB with filters`);
+      const docs = await Doctor.find(mongoQuery)
+        .sort({ rating: -1 })
+        .limit(numLimit)
+        .lean();
       return res.json(docs);
     }
 
-    // 5 — Filter by specialty if provided
-    let filtered = elements.filter(e => e.tags && e.tags.name);
-    
-    if (specialty) {
-      const lowerSpec = specialty.toLowerCase();
-      // First try to match specialty tags
-      let specMatches = filtered.filter(e =>
-        (e.tags.healthcare_speciality || '').toLowerCase().includes(lowerSpec) ||
-        (e.tags.speciality || '').toLowerCase().includes(lowerSpec)
-      );
-      // If we find exact specialty matches, use those
-      if (specMatches.length > 0) {
-        filtered = specMatches;
+    // 2️⃣ Query Overpass API (simplified & fast)
+    const overpassQuery = `[out:json][timeout:10];
+(
+  node["amenity"="doctors"](around:10000,${coords.lat},${coords.lng});
+  way["amenity"="doctors"](around:10000,${coords.lat},${coords.lng});
+);
+out center;`;
+
+    let doctors = [];
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000); // 8s timeout
+      
+      const query = encodeURIComponent(overpassQuery);
+      const overpassUrl = `https://overpass-api.de/api/interpreter?data=${query}`;
+      
+      const overpassRes = await fetch(overpassUrl, {
+        headers: { 'User-Agent': 'DocFinderApp/1.0' },
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      
+      if (overpassRes.ok) {
+        const data = await overpassRes.json();
+        const elements = data.elements || [];
+        
+        doctors = elements
+          .filter(e => e.tags && e.tags.name)
+          .map(e => ({
+            _id: String(e.id),
+            name: e.tags.name,
+            specialty: specialty || e.tags.healthcare_speciality || 'Medical Facility',
+            city: searchCity,
+            phone: e.tags.phone || e.tags['contact:phone'] || 'Not listed',
+            fee: 0,
+            experience: 0,
+            rating: parseFloat((Math.random() * 1.5 + 3.5).toFixed(1)),
+            reviews: Math.floor(Math.random() * 150 + 20),
+            available: true,
+            emoji: '👨‍⚕️',
+            bio: `${e.tags.name} - ${searchCity}`
+          }))
+          .slice(0, parseInt(limit));
+        
+        console.log(`✅ Overpass API: Found ${doctors.length} results in ${searchCity}`);
+      } else {
+        console.log(`⚠️ Overpass API returned ${overpassRes.status}`);
       }
-      // Otherwise keep all results (don't filter too strictly)
+    } catch (osmErr) {
+      console.log(`⚠️ Overpass timeout/error: ${osmErr.message}`);
     }
 
-    // 6 — Map to doctor format
-    const doctors = filtered.map(e => ({
-      _id:       String(e.id),
-      name:      e.tags.name,
-      specialty: e.tags.healthcare_speciality
-                 || e.tags.speciality
-                 || specialty
-                 || 'General Physician',
-      city:      e.tags['addr:city']
-                 || e.tags['addr:suburb']
-                 || searchCity,
-      address:   [
-                   e.tags['addr:housenumber'],
-                   e.tags['addr:street'],
-                   e.tags['addr:suburb'],
-                   e.tags['addr:city']
-                 ].filter(Boolean).join(', ') || searchCity,
-      phone:     e.tags.phone
-                 || e.tags['contact:phone']
-                 || 'Not listed',
-      experience: 0,
-      rating:    parseFloat((Math.random() * (5 - 3.5) + 3.5).toFixed(1)),
-      reviews:   Math.floor(Math.random() * 200 + 20),
-      available: true,
-      fee:       0,
-      emoji:     '👨‍⚕️',
-      bio:       `${e.tags.name} is a medical facility in ${searchCity}.`
-                 + (e.tags.opening_hours
-                    ? ` Opening hours: ${e.tags.opening_hours}.`
-                    : '')
-    }));
+    // 3️⃣ If no API results, use MongoDB
+    if (doctors.length === 0) {
+      const mongoQuery = {};
+      if (name) {
+        mongoQuery.$or = [
+          { name: { $regex: name, $options: 'i' } },
+          { specialty: { $regex: name, $options: 'i' } }
+        ];
+      }
+      if (specialty) mongoQuery.specialty = { $regex: specialty, $options: 'i' };
+      if (city) mongoQuery.city = { $regex: city, $options: 'i' };
+      
+      doctors = await Doctor.find(mongoQuery)
+        .sort({ rating: -1 })
+        .limit(numLimit)
+        .lean();
+      console.log(`✓ MongoDB fallback: Found ${doctors.length} doctors`);
+    }
 
     res.json(doctors);
 
   } catch (err) {
-    console.error('OSM Error:', err.message);
-    // Always fallback to MongoDB
-    try {
-      const docs = await Doctor.find({}).sort({ rating: -1 });
-      res.json(docs);
-    } catch (dbErr) {
-      res.status(500).json({ error: 'Server error' });
-    }
+    console.error('Error:', err.message);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
@@ -230,42 +219,10 @@ out center;
 // ─────────────────────────────────────
 router.get('/:id', async (req, res) => {
   try {
-    // First try MongoDB
-    const doc = await Doctor.findById(req.params.id).catch(() => null);
+    const doc = await Doctor.findById(req.params.id);
     if (doc) return res.json(doc);
-
-    // Then try Overpass by node ID
-    const url  = `https://overpass-api.de/api/interpreter`
-               + `?data=[out:json];node(${req.params.id});out body;`;
-    const oRes  = await fetch(url, {
-      headers: { 'User-Agent': 'DocFinderApp/1.0' }
-    });
-    const oData = await oRes.json();
-    const e     = (oData.elements || [])[0];
-
-    if (!e || !e.tags) {
-      return res.status(404).json({ error: 'Doctor not found' });
-    }
-
-    res.json({
-      _id:       String(e.id),
-      name:      e.tags.name || 'Unknown',
-      specialty: e.tags.healthcare_speciality || 'General Physician',
-      city:      e.tags['addr:city'] || 'N/A',
-      address:   [
-                   e.tags['addr:housenumber'],
-                   e.tags['addr:street'],
-                   e.tags['addr:suburb'],
-                   e.tags['addr:city']
-                 ].filter(Boolean).join(', ') || 'N/A',
-      phone:     e.tags.phone || e.tags['contact:phone'] || 'Not listed',
-      rating:    parseFloat((Math.random() * (5 - 3.5) + 3.5).toFixed(1)),
-      reviews:   Math.floor(Math.random() * 200 + 20),
-      available: true,
-      emoji:     '👨‍⚕️',
-      bio:       `${e.tags.name} — ${e.tags['addr:street'] || ''} ${e.tags['addr:city'] || ''}`
-    });
-
+    
+    res.status(404).json({ error: 'Doctor not found' });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
